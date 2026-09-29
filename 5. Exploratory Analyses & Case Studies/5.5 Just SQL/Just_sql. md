@@ -1,1 +1,230 @@
-# 
+---
+title: "Step-by-Step Statistical Analysis via SQL: Advanced Median & Anomalies"
+author: "[Your Name]"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: paged
+---
+
+This part of the portfolio is a continuation and in this section, we tackle a very common real-world scenario: **numeric variables stored as text (strings) mixed with anomalies**. 
+
+If you try to calculate a median on a column containing `"15.5 mins"`, `"N/A"`, or `"1.2.3"`, standard SQL will throw an error. I attempt using PostgreSQL's robust regex and casting functions to extract valid numbers, identify extreme outliers using the IQR method, and *then* calculate the median.
+
+```{r setup-advanced, include=FALSE}
+library(DBI)
+library(duckdb)
+library(ggplot2)
+library(dplyr)
+
+# Initialize in-memory DuckDB (PostgreSQL dialect)
+con <- dbConnect(duckdb())
+
+# Helper to run SQL and return a dataframe
+run_sql <- function(query) {
+  dbGetQuery(con, query)
+}
+
+theme_set(theme_minimal() + theme(plot.title = element_text(face = "bold")))
+set.seed(842)
+```
+
+## 🎯 The Objective: Medians with Messy Strings & Outliers
+
+In production databases, numeric data is often incorrectly logged as strings (e.g., `"45 mins"`, `"N/A"`, `"12.5.5"`). Furthermore, extreme outliers (like a bot typing 9999) can skew the mathematical thresholds used to identify anomalies. 
+
+In this section, we will:
+1. Extract valid numerics from a poorly formatted text column using SQL Regex.
+2. Use the **Interquartile Range (IQR) method** in SQL to define what constitutes an "anomaly."
+3. Filter those anomalies and calculate a mathematically sound **Median**.
+
+---
+
+## Step 7: Simulating Incorrect Formats & Extreme Anomalies
+
+### Step 7.1: Generate a new messy text-based numeric column
+```{r}
+# Let's grab the clean_events table from the previous analysis, but destroy the formatting
+# of session_time_clean to simulate a raw, badly logged text column.
+messy_text_data <- run_sql("SELECT user_id, group_assignment, revenue FROM clean_events")
+
+# Inject strings, multiple decimals, and extreme outliers
+messy_text_data$session_text <- sapply(messy_text_data$session_time_clean <- runif(nrow(messy_text_data), 5, 25), function(x) {
+  bug_type <- sample(1:5, 1, prob = c(0.7, 0.1, 0.1, 0.05, 0.05))
+  if(bug_type == 1) return(paste0(round(x, 1), " mins"))
+  if(bug_type == 2) return(paste0(round(x, 2), "minutes"))
+  if(bug_type == 3) return("N/A")
+  if(bug_type == 4) return(paste0(x, ".", sample(10:99, 1))) # Multiple decimals: 15.34.45
+  if(bug_type == 5) return(as.character(sample(500:1000, 1))) # Extreme bot outlier
+})
+
+# Write to database
+dbWriteTable(con, "raw_text_events", messy_text_data, overwrite = TRUE)
+```
+
+---
+
+## Step 8: Diagnosing the Incorrect Formats
+
+Before calculating anything, we must profile the text column to understand the data quality.
+
+### Step 8.1: Inspect raw string values
+```{r}
+run_sql("
+SELECT session_text, COUNT(*) AS count
+FROM raw_text_events
+GROUP BY session_text
+ORDER BY count DESC
+LIMIT 10;
+")
+```
+
+---
+
+## Step 9: Extracting Valid Numbers with SQL Regex
+
+We need to isolate the first valid number from the string. PostgreSQL allows us to use `REGEXP_REPLACE` or `SUBSTRING`. Here, we will strip out everything except digits and decimals, then use `TRY_CAST` to convert it to a numeric format safely (invalid conversions become `NULL`).
+
+### Step 9.1: Clean and cast the text to numeric
+```{r}
+run_sql("
+CREATE OR REPLACE TABLE extracted_numeric AS
+SELECT 
+  user_id,
+  group_assignment,
+  revenue,
+  -- Step 1: Keep only digits and dots. 
+  -- Step 2: TRY_CAST to numeric. If it fails (e.g., multiple dots), it becomes NULL.
+  TRY_CAST(REGEXP_REPLACE(session_text, '[^0-9.]', '', 'g') AS DOUBLE) AS session_numeric
+FROM raw_text_events;
+
+SELECT session_text, session_numeric
+FROM raw_text_events r
+JOIN extracted_numeric e USING(user_id)
+WHERE r.session_text LIKE '%N/A%' 
+   OR r.session_text LIKE '%mins%'
+LIMIT 10;
+")
+```
+
+---
+
+## Step 10: Identifying Anomalies using the IQR Method
+
+Now that we have valid numbers, we still have extreme outliers (e.g., 500+ minutes). Standard deviation won't work well here because the outliers inflate the mean and SD. Instead, we use the **Interquartile Range (IQR)**.
+
+**Formula:** An anomaly is anything below `Q1 - (1.5 * IQR)` or above `Q3 + (1.5 * IQR)`.
+
+### Step 10.1: Calculate Q1, Q3, and IQR in SQL
+```{r}
+run_sql("
+CREATE OR REPLACE TABLE iqr_bounds AS
+SELECT 
+  PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY session_numeric) AS q1,
+  PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY session_numeric) AS q3
+FROM extracted_numeric
+WHERE session_numeric IS NOT NULL;
+
+SELECT * FROM iqr_bounds;
+")
+```
+
+### Step 10.2: Define the upper and lower anomaly thresholds
+```{r}
+run_sql("
+CREATE OR REPLACE TABLE anomaly_thresholds AS
+SELECT 
+  q1, 
+  q3, 
+  (q3 - q1) AS iqr,
+  (q1 - 1.5 * (q3 - q1)) AS lower_bound,
+  (q3 + 1.5 * (q3 - q1)) AS upper_bound
+FROM iqr_bounds;
+
+SELECT * FROM anomaly_thresholds;
+")
+```
+
+---
+
+## Step 11: Filtering Anomalies & Calculating the True Median
+
+Now we filter out the `NULLs` and the IQR anomalies, leaving us with a statistically pure dataset to calculate our final Median.
+
+### Step 11.1: Calculate Mean vs. Median on clean data
+```{r}
+run_sql("
+SELECT 
+  COUNT(*) AS valid_sample_size,
+  ROUND(AVG(e.session_numeric), 2) AS mean_session,
+  ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY e.session_numeric), 2) AS median_session
+FROM extracted_numeric e
+CROSS JOIN anomaly_thresholds t
+WHERE e.session_numeric IS NOT NULL
+  AND e.session_numeric BETWEEN t.lower_bound AND t.upper_bound;
+")
+```
+
+**Notice the difference:** In the presence of extreme outliers and skewness, the Mean is mathematically pulled toward the tail, while the Median remains robust and represents the "typical" user.
+
+---
+
+## Step 12: Visualizing the Impact of Anomaly Removal in R
+
+Let's pull the pre-cleaned and post-cleaned distributions into R to visualize why this matters.
+
+### Step 12.1: Query raw vs cleaned distributions
+```{r}
+# Raw distribution (with anomalies)
+raw_dist <- run_sql("
+  SELECT session_numeric AS session_time, 'Raw (With Anomalies)' AS status
+  FROM extracted_numeric
+  WHERE session_numeric IS NOT NULL
+")
+
+# Clean distribution (anomalies removed)
+clean_dist <- run_sql("
+  SELECT e.session_numeric AS session_time, 'Clean (IQR Filtered)' AS status
+  FROM extracted_numeric e
+  CROSS JOIN anomaly_thresholds t
+  WHERE e.session_numeric IS NOT NULL
+    AND e.session_numeric BETWEEN t.lower_bound AND t.upper_bound
+")
+
+# Combine for plotting
+plot_df <- rbind(raw_dist, clean_dist)
+```
+
+### Step 12.2: Plot the comparison
+```{r}
+ggplot(plot_df, aes(x = session_time, fill = status)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~status, scales = "free") +
+  scale_fill_manual(values = c("Raw (With Anomalies)" = "firebrick", 
+                               "Clean (IQR Filtered)" = "steelblue")) +
+  labs(
+    title = "The Impact of SQL Anomaly Removal on Session Time",
+    subtitle = "Raw data is unreadable due to bots; IQR filtering restores the true distribution",
+    x = "Session Time (Minutes)",
+    y = "Density"
+  ) +
+  theme(legend.position = "none")
+```
+
+---
+
+## 🏆 Conclusion: Why This Matters
+
+| Skill | How it was demonstrated |
+|-------|-------------------------|
+| **String Parsing** | Used `REGEXP_REPLACE` to isolate numerics from messy strings (`"15 mins"`). |
+| **Safe Casting** | Used `TRY_CAST` to prevent pipeline crashes when encountering malformed decimals (`"12.5.5"`). |
+| **Statistical Outlier Detection** | Calculated Q1, Q3, and IQR entirely in SQL to define mathematical anomaly thresholds. |
+| **Robust Statistics** | Demonstrated why calculating a Median is superior to a Mean when dealing with zero-inflated or bot-heavy production data. |
+
+By structuring the SQL this way, the database does 99% of the heavy lifting. R is only used at the very end to visualize the final, pre-aggregated result. This is exactly how high-scale data pipelines operate in production.
