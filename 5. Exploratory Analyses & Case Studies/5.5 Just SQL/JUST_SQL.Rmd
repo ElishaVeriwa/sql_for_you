@@ -1,6 +1,6 @@
 ---
 title: "Step-by-Step Statistical Analysis via SQL: Advanced Median & Anomalies"
-author: "[Your Name]"
+author: "Veriwa Elisha"
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -12,7 +12,7 @@ output:
     df_print: paged
 ---
 
-This part of the portfolio is a continuation and in this section, we tackle a very common real-world scenario: **numeric variables stored as text (strings) mixed with anomalies**. 
+This part of the portfolio is a continuation and in this section, I attempt to tackle a very common real-world scenario: **numeric variables stored as text (strings) mixed with anomalies**. 
 
 If you try to calculate a median on a column containing `"15.5 mins"`, `"N/A"`, or `"1.2.3"`, standard SQL will throw an error. I attempt using PostgreSQL's robust regex and casting functions to extract valid numbers, identify extreme outliers using the IQR method, and *then* calculate the median.
 
@@ -22,7 +22,7 @@ library(duckdb)
 library(ggplot2)
 library(dplyr)
 
-# Initialize in-memory DuckDB (PostgreSQL dialect)
+# Initialise in-memory DuckDB (PostgreSQL dialect)
 con <- dbConnect(duckdb())
 
 # Helper to run SQL and return a dataframe
